@@ -8,10 +8,8 @@ import pandas as pd
 import json
 import re
 
-# LangChain Imports
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+# Gemini Imports
+from google import genai
 from pydantic import BaseModel
 
 
@@ -20,12 +18,12 @@ from pydantic import BaseModel
 # ==========================
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in .env file")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY not found in .env file")
 
 
-# ==========================
+    # ==========================
 # 2️⃣ Define Models
 # ==========================
 
@@ -37,7 +35,9 @@ class TravelData(BaseModel):
     from_location: Optional[str]
     to_location: Optional[str]
     travel_date: Optional[str]
+    booking_date: Optional[str]
     expense: Optional[float]
+    source_file: Optional[str] = None  # New field for hyperlink
 
 
 class HotelData(BaseModel):
@@ -46,8 +46,10 @@ class HotelData(BaseModel):
     city: Optional[str]
     check_in: Optional[str]
     check_out: Optional[str]
+    booking_date: Optional[str]
     total_amount: Optional[float]
     number_of_nights: Optional[int]
+    source_file: Optional[str] = None  # New field for hyperlink
 
 
 class AttachmentExtraction(BaseModel):
@@ -93,69 +95,79 @@ def extract_attachment_text(file_path: str) -> str:
 # 4️⃣ LLM Setup
 # ==========================
 
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0
-)
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
-parser = PydanticOutputParser(pydantic_object=AttachmentExtraction)
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a professional travel and hotel booking extraction system."),
-    ("user", """
+prompt_template = """
+You are a professional travel and hotel booking extraction system.
 Extract all travel and hotel booking information from the document below.
 
 TRAVEL fields:
-- passenger_name
-- airline
-- pnr
-- flight_number
-- from_location
-- to_location
-- travel_date
-- expense
+- passenger_name (string)
+- airline (string)
+- pnr (string)
+- flight_number (string)
+- from_location (string)
+- to_location (string)
+- travel_date (string)
+- booking_date (string)
+- expense (float)
 
 HOTEL fields:
-- guest_name
-- hotel_name
-- city
-- check_in
-- check_out
-- total_amount
-- number_of_nights
+- guest_name (string)
+- hotel_name (string)
+- city (string)
+- check_in (string)
+- check_out (string)
+- booking_date (string)
+- total_amount (float)
+- number_of_nights (integer)
 
 Rules:
+- Respond with a valid JSON object. It must have exactly two keys: "travels" and "hotels", both containing lists of the respective objects.
 - If no travel bookings exist, return: "travels": []
 - If no hotel bookings exist, return: "hotels": []
 - NEVER return null inside lists
 - Do NOT guess
 - Return valid JSON only
 
-{format_instructions}
-
 Document Content:
 {attachment_text}
-""")
-])
+"""
 
 
 # ==========================
 # 5️⃣ Extraction Function
 # ==========================
 
-def extract_from_attachment(attachment_text: str) -> AttachmentExtraction:
+def extract_from_attachment(attachment_text: str, source_file: str) -> AttachmentExtraction:
 
-    formatted_prompt = prompt.format(
-        attachment_text=attachment_text,
-        format_instructions=parser.get_format_instructions()
+    formatted_prompt = prompt_template.format(
+        attachment_text=attachment_text
     )
 
-    response = llm.invoke(formatted_prompt)
+    response = client.models.generate_content(
+        model='gemini-flash-lite-latest',
+        contents=formatted_prompt,
+        config={
+            'response_mime_type': 'application/json',
+            'response_schema': AttachmentExtraction,
+        }
+    )
 
-    raw_output = response.content.strip()
+    raw_output = response.text.strip() if response.text else ""
 
     if not raw_output:
         raise ValueError("❌ LLM returned empty response")
+
+    # Assuming the response matches the schema, we inject the source_file
+    data = json.loads(raw_output)
+    
+    for t in data.get("travels", []):
+        t["source_file"] = source_file
+    for h in data.get("hotels", []):
+        h["source_file"] = source_file
+
+    return AttachmentExtraction.model_validate(data)
 
     # --- Remove Markdown Fences ---
     raw_output = re.sub(r"```json", "", raw_output)
@@ -191,26 +203,46 @@ def extract_from_attachment(attachment_text: str) -> AttachmentExtraction:
 def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"):
 
     # Convert extracted data to rows
-    travel_rows = [{
-        "Passenger Name": t.passenger_name,
-        "Airline": t.airline,
-        "PNR": t.pnr,
-        "Flight Number": t.flight_number,
-        "From Location": t.from_location,
-        "To Location": t.to_location,
-        "Travel Date": t.travel_date,
-        "Expense": t.expense
-    } for t in result.travels]
+    travel_rows = []
+    for t in result.travels:
+        row = {
+            "Passenger Name": t.passenger_name,
+            "Airline": t.airline,
+            "PNR": t.pnr,
+            "Flight Number": t.flight_number,
+            "From Location": t.from_location,
+            "To Location": t.to_location,
+            "Travel Date": t.travel_date,
+            "Booking Date": t.booking_date,
+            "Expense": t.expense,
+        }
+        if t.source_file:
+            # Create Excel Hyperlink formula
+            # Use relative path for better compatibility with Excel on Mac
+            rel_path = os.path.relpath(t.source_file, os.path.dirname(os.path.abspath(output_file)))
+            row["Source Email"] = f'=HYPERLINK("{rel_path}", "{os.path.basename(t.source_file)}")'
+        else:
+            row["Source Email"] = ""
+        travel_rows.append(row)
 
-    hotel_rows = [{
-        "Guest Name": h.guest_name,
-        "Hotel Name": h.hotel_name,
-        "City": h.city,
-        "Check In": h.check_in,
-        "Check Out": h.check_out,
-        "Total Amount": h.total_amount,
-        "Number of Nights": h.number_of_nights
-    } for h in result.hotels]
+    hotel_rows = []
+    for h in result.hotels:
+        row = {
+            "Guest Name": h.guest_name,
+            "Hotel Name": h.hotel_name,
+            "City": h.city,
+            "Check In": h.check_in,
+            "Check Out": h.check_out,
+            "Booking Date": h.booking_date,
+            "Total Amount": h.total_amount,
+            "Number of Nights": h.number_of_nights,
+        }
+        if h.source_file:
+            rel_path = os.path.relpath(h.source_file, os.path.dirname(os.path.abspath(output_file)))
+            row["Source Email"] = f'=HYPERLINK("{rel_path}", "{os.path.basename(h.source_file)}")'
+        else:
+            row["Source Email"] = ""
+        hotel_rows.append(row)
 
     new_travel_df = pd.DataFrame(travel_rows)
     new_hotel_df = pd.DataFrame(hotel_rows)
@@ -259,7 +291,7 @@ def main():
                 continue
 
             try:
-                result = extract_from_attachment(attachment_text)
+                result = extract_from_attachment(attachment_text, file_path)
                 all_results.append(result)
                 print("✅ Extraction successful.")
 
