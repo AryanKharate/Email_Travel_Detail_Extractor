@@ -52,9 +52,21 @@ class HotelData(BaseModel):
     source_file: Optional[str] = None  # New field for hyperlink
 
 
+class CabData(BaseModel):
+    passenger_name: Optional[str]
+    operator_name: Optional[str]
+    pickup_location: Optional[str]
+    drop_location: Optional[str]
+    ride_date: Optional[str]
+    booking_date: Optional[str]
+    total_amount: Optional[float]
+    source_file: Optional[str] = None
+
+
 class AttachmentExtraction(BaseModel):
     travels: List[TravelData]
     hotels: List[HotelData]
+    cabs: List[CabData]
 
 
 # ==========================
@@ -75,20 +87,30 @@ def extract_attachment_text(file_path: str) -> str:
 
             if filename:
                 print(f"📎 Found attachment: {filename}")
+                # This extractor reads only PDF attachments.
+                if not filename.lower().endswith(".pdf"):
+                    continue
 
-                filepath = os.path.join("attachments", filename)
+                safe_filename = _safe_attachment_filename(filename)
+                filepath = os.path.join("attachments", safe_filename)
                 payload = part.get_payload(decode=True)
+
+                if not payload:
+                    continue
 
                 with open(filepath, "wb") as f:
                     f.write(payload)
 
-                if filename.lower().endswith(".pdf"):
-                    print("📄 Extracting text from PDF...")
-                    with pdfplumber.open(filepath) as pdf:
-                        for page in pdf.pages:
-                            attachment_text += page.extract_text() or ""
-
+                print("📄 Extracting text from PDF...")
+                with pdfplumber.open(filepath) as pdf:
+                    for page in pdf.pages:
+                        attachment_text += page.extract_text() or ""
     return attachment_text.strip()
+
+def _safe_attachment_filename(filename: str) -> str:
+    name = os.path.basename(filename).replace("\\", "_").replace("/", "_")
+    name = re.sub(r'[:*?"<>|]', "_", name).strip(" .")
+    return name or "attachment.pdf"
 
 
 # ==========================
@@ -98,8 +120,8 @@ def extract_attachment_text(file_path: str) -> str:
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
 prompt_template = """
-You are a professional travel and hotel booking extraction system.
-Extract all travel and hotel booking information from the document below.
+You are a professional travel, hotel, and cab booking extraction system.
+Extract all travel, hotel, and cab booking information from the document below.
 
 TRAVEL fields:
 - passenger_name (string)
@@ -122,10 +144,20 @@ HOTEL fields:
 - total_amount (float)
 - number_of_nights (integer)
 
+CAB fields:
+- passenger_name (string)
+- operator_name (string)
+- pickup_location (string)
+- drop_location (string)
+- ride_date (string)
+- booking_date (string)
+- total_amount (float)
+
 Rules:
-- Respond with a valid JSON object. It must have exactly two keys: "travels" and "hotels", both containing lists of the respective objects.
+- Respond with a valid JSON object. It must have exactly three keys: "travels", "hotels", and "cabs", all containing lists of the respective objects.
 - If no travel bookings exist, return: "travels": []
 - If no hotel bookings exist, return: "hotels": []
+- If no cab bookings exist, return: "cabs": []
 - NEVER return null inside lists
 - Do NOT guess
 - Return valid JSON only
@@ -166,6 +198,8 @@ def extract_from_attachment(attachment_text: str, source_file: str) -> Attachmen
         t["source_file"] = source_file
     for h in data.get("hotels", []):
         h["source_file"] = source_file
+    for c in data.get("cabs", []):
+        c["source_file"] = source_file
 
     return AttachmentExtraction.model_validate(data)
 
@@ -193,6 +227,9 @@ def extract_from_attachment(attachment_text: str, source_file: str) -> Attachmen
 
     if parsed_json.get("hotels") in [None, [None]]:
         parsed_json["hotels"] = []
+
+    if parsed_json.get("cabs") in [None, [None]]:
+        parsed_json["cabs"] = []
 
     return AttachmentExtraction.model_validate(parsed_json)
 
@@ -244,24 +281,48 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
             row["Source Email"] = ""
         hotel_rows.append(row)
 
+    cab_rows = []
+    for c in result.cabs:
+        row = {
+            "Passenger Name": c.passenger_name,
+            "Operator Name": c.operator_name,
+            "Pickup Location": c.pickup_location,
+            "Drop Location": c.drop_location,
+            "Ride Date": c.ride_date,
+            "Booking Date": c.booking_date,
+            "Total Amount": c.total_amount,
+        }
+        if c.source_file:
+            rel_path = os.path.relpath(c.source_file, os.path.dirname(os.path.abspath(output_file)))
+            row["Source Email"] = f'=HYPERLINK("{rel_path}", "{os.path.basename(c.source_file)}")'
+        else:
+            row["Source Email"] = ""
+        cab_rows.append(row)
+
     new_travel_df = pd.DataFrame(travel_rows)
     new_hotel_df = pd.DataFrame(hotel_rows)
+    new_cab_df = pd.DataFrame(cab_rows)
 
     # If file exists → append
     if os.path.exists(output_file):
-        existing_travel = pd.read_excel(output_file, sheet_name="Travel")
-        existing_hotel = pd.read_excel(output_file, sheet_name="Hotel")
+        xls = pd.ExcelFile(output_file)
+        existing_travel = pd.read_excel(output_file, sheet_name="Travel") if "Travel" in xls.sheet_names else pd.DataFrame()
+        existing_hotel = pd.read_excel(output_file, sheet_name="Hotel") if "Hotel" in xls.sheet_names else pd.DataFrame()
+        existing_cab = pd.read_excel(output_file, sheet_name="Cab") if "Cab" in xls.sheet_names else pd.DataFrame()
 
         combined_travel = pd.concat([existing_travel, new_travel_df], ignore_index=True)
         combined_hotel = pd.concat([existing_hotel, new_hotel_df], ignore_index=True)
+        combined_cab = pd.concat([existing_cab, new_cab_df], ignore_index=True)
     else:
         combined_travel = new_travel_df
         combined_hotel = new_hotel_df
+        combined_cab = new_cab_df
 
     # Save back
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         combined_travel.to_excel(writer, sheet_name="Travel", index=False)
         combined_hotel.to_excel(writer, sheet_name="Hotel", index=False)
+        combined_cab.to_excel(writer, sheet_name="Cab", index=False)
 
     print(f"\n✅ Data appended to {output_file}")
 
@@ -272,7 +333,7 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
 
 def main():
 
-    folder_path = "/Users/aryankharate/Travel_Detail_Extractor/emails"
+    folder_path = "Filtered_1"
 
     all_results = []
 
@@ -306,14 +367,17 @@ def main():
     # Merge all results into one
     combined_travels = []
     combined_hotels = []
+    combined_cabs = []
 
     for result in all_results:
         combined_travels.extend(result.travels)
         combined_hotels.extend(result.hotels)
+        combined_cabs.extend(result.cabs)
 
     final_result = AttachmentExtraction(
         travels=combined_travels,
-        hotels=combined_hotels
+        hotels=combined_hotels,
+        cabs=combined_cabs
     )
 
     save_to_excel(final_result)
@@ -322,3 +386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
