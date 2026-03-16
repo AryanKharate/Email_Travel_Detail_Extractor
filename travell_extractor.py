@@ -7,6 +7,8 @@ import pdfplumber
 import pandas as pd
 import json
 import re
+from datetime import datetime
+from dateutil import parser as date_parser
 
 # Gemini Imports
 from google import genai
@@ -30,6 +32,7 @@ if not GOOGLE_API_KEY:
 class TravelData(BaseModel):
     passenger_name: Optional[str]
     airline: Optional[str]
+    booking_partner: Optional[str]
     pnr: Optional[str]
     flight_number: Optional[str]
     from_location: Optional[str]
@@ -43,6 +46,7 @@ class TravelData(BaseModel):
 class HotelData(BaseModel):
     guest_name: Optional[str]
     hotel_name: Optional[str]
+    booking_partner: Optional[str]
     city: Optional[str]
     check_in: Optional[str]
     check_out: Optional[str]
@@ -55,6 +59,7 @@ class HotelData(BaseModel):
 class CabData(BaseModel):
     passenger_name: Optional[str]
     operator_name: Optional[str]
+    booking_partner: Optional[str]
     pickup_location: Optional[str]
     drop_location: Optional[str]
     ride_date: Optional[str]
@@ -67,6 +72,40 @@ class AttachmentExtraction(BaseModel):
     travels: List[TravelData]
     hotels: List[HotelData]
     cabs: List[CabData]
+
+
+def normalize_date_value(value: Optional[str]) -> Optional[str]:
+    """Normalize many date formats to dd-mm-yyyy."""
+    if value is None:
+        return None
+
+    if isinstance(value, float) and pd.isna(value):
+        return None
+
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.strftime("%d-%m-%Y")
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat"}:
+        return None
+
+    # Handle compact month forms like 12May2025 / 03MAR2025 / 1Aug25
+    text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    try:
+        parsed = date_parser.parse(text, dayfirst=True, fuzzy=True)
+        return parsed.strftime("%d-%m-%Y")
+    except (ValueError, TypeError, OverflowError):
+        return text
+
+
+def normalize_date_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].apply(normalize_date_value)
+    return df
 
 
 # ==========================
@@ -126,6 +165,7 @@ Extract all travel, hotel, and cab booking information from the document below.
 TRAVEL fields:
 - passenger_name (string)
 - airline (string)
+- booking_partner (string)
 - pnr (string)
 - flight_number (string)
 - from_location (string)
@@ -137,6 +177,7 @@ TRAVEL fields:
 HOTEL fields:
 - guest_name (string)
 - hotel_name (string)
+- booking_partner (string)
 - city (string)
 - check_in (string)
 - check_out (string)
@@ -147,6 +188,7 @@ HOTEL fields:
 CAB fields:
 - passenger_name (string)
 - operator_name (string)
+- booking_partner (string)
 - pickup_location (string)
 - drop_location (string)
 - ride_date (string)
@@ -245,6 +287,7 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
         row = {
             "Passenger Name": t.passenger_name,
             "Airline": t.airline,
+            "Booking Partner": t.booking_partner or t.airline,
             "PNR": t.pnr,
             "Flight Number": t.flight_number,
             "From Location": t.from_location,
@@ -267,6 +310,7 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
         row = {
             "Guest Name": h.guest_name,
             "Hotel Name": h.hotel_name,
+            "Booking Partner": h.booking_partner or h.hotel_name,
             "City": h.city,
             "Check In": h.check_in,
             "Check Out": h.check_out,
@@ -286,6 +330,7 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
         row = {
             "Passenger Name": c.passenger_name,
             "Operator Name": c.operator_name,
+            "Booking Partner": c.booking_partner or c.operator_name,
             "Pickup Location": c.pickup_location,
             "Drop Location": c.drop_location,
             "Ride Date": c.ride_date,
@@ -318,6 +363,10 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
         combined_hotel = new_hotel_df
         combined_cab = new_cab_df
 
+    combined_travel = normalize_date_columns(combined_travel, ["Travel Date", "Booking Date"])
+    combined_hotel = normalize_date_columns(combined_hotel, ["Check In", "Check Out", "Booking Date"])
+    combined_cab = normalize_date_columns(combined_cab, ["Ride Date", "Booking Date"])
+
     # Save back
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         combined_travel.to_excel(writer, sheet_name="Travel", index=False)
@@ -333,7 +382,7 @@ def save_to_excel(result: AttachmentExtraction, output_file="travel_output.xlsx"
 
 def main():
 
-    folder_path = "Filtered_1"
+    folder_path = "Filtered_50"
 
     all_results = []
 
